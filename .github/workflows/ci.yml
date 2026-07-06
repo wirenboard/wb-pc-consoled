@@ -1,0 +1,15 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: python3 -m py_compile wb-pc-consoled wb-pc-console
+      - name: Unit tests
+        run: python3 -m unittest discover -v -s tests -t .
