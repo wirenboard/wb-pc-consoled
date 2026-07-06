@@ -1,10 +1,9 @@
 [Unit]
 Description=Wiren Board debug console keeper (%i)
 Documentation=https://github.com/wirenboard/wb-pc-consoled
-# never rate-limit restarts; refuse `systemctl --user stop/restart` --
-# upgrade path is `systemctl --user kill wb-pc-console@%i` (auto-restarts)
+# never rate-limit restarts: any kill (incl. a rogue `fuser -k`) revives
+# the daemon within RestartSec
 StartLimitIntervalSec=0
-RefuseManualStop=yes
 
 [Service]
 Type=simple
@@ -13,9 +12,9 @@ Restart=always
 RestartSec=1
 SyslogIdentifier=wb-pc-console-%i
 # Per-instance overrides: systemctl --user edit wb-pc-console@INSTANCE
+# (full knob list: wb-pc-consoled --help)
 #Environment=WB_PC_CONSOLE_BAUD=115200
 #Environment=WB_PC_CONSOLE_GLOB=/dev/serial/by-id/usb-...-if00
-#Environment=WB_PC_CONSOLE_AUTO_RESET_IDLE=0
 
 [Install]
 WantedBy=default.target

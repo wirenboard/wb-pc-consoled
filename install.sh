@@ -20,14 +20,18 @@ if [ "$(loginctl show-user "$USER" -P Linger 2>/dev/null)" != "yes" ]; then
         || echo "WARN: enable-linger failed; run manually: loginctl enable-linger $USER"
 fi
 
-# ModemManager ignore rule needs root; install if passwordless sudo is around
+# ModemManager ignore rule needs root; install if passwordless sudo is around.
+# `udevadm trigger` is required for already-plugged consoles: a rules reload
+# alone does not re-evaluate devices that are enumerated already.
 if [ ! -f /etc/udev/rules.d/99-wb-pc-console.rules ]; then
     if sudo -n true 2>/dev/null; then
         sudo -n cp "$here/99-wb-pc-console.rules" /etc/udev/rules.d/ \
-            && sudo -n udevadm control --reload || true
+            && sudo -n udevadm control --reload \
+            && sudo -n udevadm trigger --subsystem-match=tty || true
     else
         echo "NOTE: to keep ModemManager off the consoles, run once:"
-        echo "  sudo cp $here/99-wb-pc-console.rules /etc/udev/rules.d/ && sudo udevadm control --reload"
+        echo "  sudo cp $here/99-wb-pc-console.rules /etc/udev/rules.d/ \\"
+        echo "      && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=tty"
     fi
 fi
 

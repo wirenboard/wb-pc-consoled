@@ -8,19 +8,26 @@ Commands:
   list                                devices + running instances
   status INST                         daemon status.json + service state
   files INST                          print per-instance file paths
-  send INST [TEXT...]                 send TEXT + newline (no TEXT: read stdin)
+  send INST [TEXT...]                 send TEXT + newline (-n: no newline;
+                                      no TEXT: read stdin)
   raw INST STRING                     send STRING with \\n \\r \\t \\e \\xNN escapes, no newline added
   key INST KEY [KEY...]               named keys: enter tab esc space backspace up down
                                       left right home end pgup pgdn delete f1-f4 ctrl-<x> sysrq-<x>
-  run INST TEXT [--expect RE] [--timeout S]   send TEXT+newline, print console output
-                                      that follows; with --expect exit 0 once RE matches
+  run INST TEXT [--expect RE] [--timeout S] [-n]   send TEXT + newline (-n: none),
+                                      print console output that follows; with
+                                      --expect exit 0 once RE matches
   expect INST RE [--timeout S]        wait for RE in new ts.log lines, print match
-  reset INST                          USB-reset the console adapter
+  reset INST [--no-wait] [--timeout S]  USB-reset the console adapter and wait
+                                      for the outcome event; exit 0 = reset done
   break INST                          send serial break
   reopen INST                         make daemon close+reopen the tty
   mark INST TEXT...                   write a marker line into ts.log
   tail INST [--ts] [-n N]             tail -F the raw (or timestamped) log
   attach INST                         interactive session, exit with Ctrl-]
+
+run/expect match against board output only: the daemon's own event lines
+(=== wb-pc-console: ..., e.g. the TX echo) are skipped, so expecting a
+token that appears in the sent command cannot false-match.
 """
 
 import argparse
@@ -163,6 +170,11 @@ def ts_size(p):
         return 0
 
 
+# daemon-generated event lines in ts.log (incl. the TX echo of what we just
+# sent); run/expect must never treat these as board output
+EVENT_RE = re.compile(r"^\[[^\]]*\] === wb-pc-console: ")
+
+
 # ---------------- commands ----------------
 
 def cmd_list(args):
@@ -257,12 +269,50 @@ def cmd_ctl_factory(line):
     return cmd
 
 
+def reset_outcome(line):
+    """0 = reset done, 1 = failed/refused, None = not an outcome event
+    (the daemon also echoes the request token into progress events such
+    as 'port closed: usb reset (...)' -- those must be waited past)."""
+    if "usb reset done" in line:
+        return 0
+    if "usb reset FAILED" in line or "usb reset refused" in line:
+        return 1
+    return None
+
+
+def cmd_reset(args):
+    """Request a USB reset and report the actual outcome via the exit code.
+
+    The ts.log offset is recorded BEFORE the ctl write and the request
+    carries a unique token that the daemon echoes into its outcome event,
+    so even an instantly-completing reset cannot be missed."""
+    p = paths(args.instance)
+    token = "req:%d.%d" % (os.getpid(), int(time.time() * 1000) % 1000000)
+    start = ts_size(p)
+    fifo_write(p["ctl"], ("reset wb-pc-console [%s]\n" % token).encode())
+    if args.no_wait:
+        return 0
+    deadline = time.monotonic() + args.timeout
+    for line in follow_lines(p["ts"], start, deadline):
+        if token not in line:
+            continue
+        rc = reset_outcome(line)
+        if rc is not None:
+            print(line)
+            return rc
+    sys.stderr.write("wb-pc-console: no reset outcome within %.0fs "
+                     "(daemon not running?)\n" % args.timeout)
+    return 1
+
+
 def cmd_expect(args):
     p = paths(args.instance)
     start = ts_size(p)
     deadline = time.monotonic() + args.timeout
     pat = re.compile(args.regex)
     for line in follow_lines(p["ts"], start, deadline):
+        if EVENT_RE.match(line):
+            continue
         if pat.search(line):
             print(line)
             return 0
@@ -284,7 +334,7 @@ def cmd_run(args):
     matched = False
     for line in follow_lines(p["ts"], start, deadline):
         print(line)
-        if pat and pat.search(line):
+        if pat and not EVENT_RE.match(line) and pat.search(line):
             matched = True
             break
     if pat and not matched:
@@ -367,7 +417,12 @@ def main():
     sp.add_argument("--timeout", type=float, default=30)
     sp.set_defaults(fn=cmd_expect)
 
-    with_inst("reset").set_defaults(fn=cmd_ctl_factory("reset requested via wb-pc-console"))
+    sp = with_inst("reset")
+    sp.add_argument("--no-wait", action="store_true",
+                    help="fire and forget, do not wait for the outcome event")
+    sp.add_argument("--timeout", type=float, default=20)
+    sp.set_defaults(fn=cmd_reset)
+
     with_inst("break").set_defaults(fn=cmd_ctl_factory("break"))
     with_inst("reopen").set_defaults(fn=cmd_ctl_factory("reopen"))
 
