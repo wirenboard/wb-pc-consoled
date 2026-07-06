@@ -63,6 +63,17 @@ class TestEventRe(unittest.TestCase):
         self.assertFalse(CLI.EVENT_RE.match(ts + "==== MARK: user marker"))
 
 
+class TestResetOutcome(unittest.TestCase):
+    def test_classification(self):
+        ts = "[2026-07-06T18:06:03.169864917+0300] === wb-pc-console: "
+        tok = "wb-pc-console [req:1.2]"
+        # progress event carrying the token is NOT an outcome
+        self.assertIsNone(CLI.reset_outcome(ts + "port closed: usb reset (%s)" % tok))
+        self.assertEqual(CLI.reset_outcome(ts + "usb reset done: /dev/bus/usb/005/012 (%s)" % tok), 0)
+        self.assertEqual(CLI.reset_outcome(ts + "usb reset FAILED: no write access to x -- see README (%s)" % tok), 1)
+        self.assertEqual(CLI.reset_outcome(ts + "usb reset refused: no device matches y (%s)" % tok), 1)
+
+
 class TestFollowLines(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

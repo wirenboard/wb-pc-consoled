@@ -269,6 +269,17 @@ def cmd_ctl_factory(line):
     return cmd
 
 
+def reset_outcome(line):
+    """0 = reset done, 1 = failed/refused, None = not an outcome event
+    (the daemon also echoes the request token into progress events such
+    as 'port closed: usb reset (...)' -- those must be waited past)."""
+    if "usb reset done" in line:
+        return 0
+    if "usb reset FAILED" in line or "usb reset refused" in line:
+        return 1
+    return None
+
+
 def cmd_reset(args):
     """Request a USB reset and report the actual outcome via the exit code.
 
@@ -285,8 +296,10 @@ def cmd_reset(args):
     for line in follow_lines(p["ts"], start, deadline):
         if token not in line:
             continue
-        print(line)
-        return 0 if "usb reset done" in line else 1
+        rc = reset_outcome(line)
+        if rc is not None:
+            print(line)
+            return rc
     sys.stderr.write("wb-pc-console: no reset outcome within %.0fs "
                      "(daemon not running?)\n" % args.timeout)
     return 1
