@@ -1,0 +1,616 @@
+#!/usr/bin/env python3
+"""wb-pc-consoled -- exclusive keeper of one Wiren Board USB debug console.
+
+Usage:  wb-pc-consoled <SERIAL>                          e.g.  wb-pc-consoled ALEPBSP3
+        wb-pc-consoled --usb-reset /dev/bus/usb/BBB/DDD  (internal helper)
+
+What it does:
+  * finds the port via /dev/serial/by-id/*<SERIAL>*-if00 -- stable across
+    /dev/ttyACMn renumbering; reopens automatically when the device
+    disappears and comes back;
+  * holds the port exclusively (TIOCEXCL): any other non-root open() gets
+    EBUSY instead of stealing bytes;
+  * SIGKILLs any other process found holding the port (fuser sweep every
+    WB_PC_CONSOLE_KILL_INTERVAL seconds and right before every open);
+  * appends every received byte verbatim to <dir>/raw.log and stamped
+    lines to <dir>/ts.log:  "[YYYY-mm-ddTHH:MM:SS.<9-digit ns>+ZZZZ] line"
+    (stamp taken when the first byte of the line arrived; partial lines
+    are flushed after WB_PC_CONSOLE_FLUSH_TIMEOUT so prompts show up);
+  * forwards bytes written into the FIFO <dir>/in to the port (queued
+    while the port is down, delivered after reopen);
+  * executes commands written into the FIFO <dir>/ctl, one per line:
+        reset [why]   -- USB reset of the underlying USB device
+        break         -- send serial break
+        reopen        -- close and reopen the tty
+        mark <text>   -- write a marker line into ts.log
+        flush         -- flush a pending partial line to ts.log
+  * maintains <dir>/status.json (atomically replaced).
+
+<dir> = $WB_PC_CONSOLE_BASE_DIR/<SERIAL>, default ~/wb-pc-console/<SERIAL>.
+
+Environment knobs (all optional):
+  WB_PC_CONSOLE_BASE_DIR        base directory            (~/wb-pc-console)
+  WB_PC_CONSOLE_GLOB            device glob override      (/dev/serial/by-id/*<SERIAL>*-if00)
+  WB_PC_CONSOLE_BAUD            baud rate                 (115200)
+  WB_PC_CONSOLE_KILL_INTERVAL   intruder sweep period, s  (1.0)
+  WB_PC_CONSOLE_WRITE_DELAY_MS  per-byte TX pacing, ms    (0 = off)
+  WB_PC_CONSOLE_FLUSH_TIMEOUT   partial-line flush, s     (1.0)
+  WB_PC_CONSOLE_MAX_BYTES       rotate log when bigger    (536870912; 0 = never)
+  WB_PC_CONSOLE_ROTATE_KEEP     rotated generations kept  (3)
+  WB_PC_CONSOLE_AUTO_RESET_IDLE USB-reset if no RX for N s (0 = off; silence is
+                             normal on a console, so this stays off by default
+                             -- agents decide via the ctl "reset" command)
+  WB_PC_CONSOLE_RESET_COOLDOWN  min seconds between USB resets (30)
+  WB_PC_CONSOLE_LOG_TX          log TX chunks as ts.log events (1)
+"""
+
+import errno
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import termios
+import time
+
+TIOCEXCL = getattr(termios, "TIOCEXCL", 0x540C)
+USBDEVFS_RESET = 0x5514  # _IO('U', 20)
+
+
+def envs(name, default):
+    return os.environ.get(name, default)
+
+
+def envf(name, default):
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def fmt_ns(ns):
+    sec, frac = divmod(ns, 1_000_000_000)
+    lt = time.localtime(sec)
+    return "%s.%09d%s" % (time.strftime("%Y-%m-%dT%H:%M:%S", lt), frac,
+                          time.strftime("%z", lt))
+
+
+class Keeper:
+    def __init__(self, instance):
+        self.inst = instance
+        self.base = os.path.expanduser(envs("WB_PC_CONSOLE_BASE_DIR", "~/wb-pc-console"))
+        self.dir = os.path.join(self.base, instance)
+        self.pattern = envs("WB_PC_CONSOLE_GLOB",
+                            "/dev/serial/by-id/*%s*-if00" % instance)
+        self.baud = int(envf("WB_PC_CONSOLE_BAUD", 115200))
+        self.kill_interval = envf("WB_PC_CONSOLE_KILL_INTERVAL", 1.0)
+        self.write_delay = envf("WB_PC_CONSOLE_WRITE_DELAY_MS", 0.0) / 1000.0
+        self.flush_timeout = envf("WB_PC_CONSOLE_FLUSH_TIMEOUT", 1.0)
+        self.max_bytes = int(envf("WB_PC_CONSOLE_MAX_BYTES", 512 * 1024 * 1024))
+        self.keep = max(1, int(envf("WB_PC_CONSOLE_ROTATE_KEEP", 3)))
+        self.auto_reset_idle = envf("WB_PC_CONSOLE_AUTO_RESET_IDLE", 0.0)
+        self.reset_cooldown = envf("WB_PC_CONSOLE_RESET_COOLDOWN", 30.0)
+        self.log_tx = envf("WB_PC_CONSOLE_LOG_TX", 1.0) != 0
+
+        self.raw_path = os.path.join(self.dir, "raw.log")
+        self.ts_path = os.path.join(self.dir, "ts.log")
+        self.in_path = os.path.join(self.dir, "in")
+        self.ctl_path = os.path.join(self.dir, "ctl")
+        self.status_path = os.path.join(self.dir, "status.json")
+
+        self.ser_fd = None
+        self.byid = None
+        self.real = None
+        self.tx = bytearray()
+        self.last_tx = 0.0
+        self.partial = bytearray()
+        self.partial_ns = 0
+        self.partial_mono = 0.0
+        self.rx_total = 0
+        self.tx_total = 0
+        self.kills = 0
+        self.last_kill = None
+        self.last_rx_mono = None
+        self.last_reset_mono = None
+        self.last_reset_ns = None
+        self.started_ns = time.time_ns()
+        self.io_errors = []  # monotonic times of recent read/open I/O errors
+        self.last_sweep = 0.0
+        self.last_status = 0.0
+        self.last_open_err = ""
+        self.waiting_logged = False
+        self.multi_warned = False
+        self.ctl_buf = b""
+        self.running = True
+
+    # ---------------- logging ----------------
+
+    def log(self, msg):
+        sys.stderr.write(msg + "\n")
+        sys.stderr.flush()
+
+    def event(self, msg):
+        try:
+            self.ts_f.write("[%s] === wb-pc-console: %s\n" % (fmt_ns(time.time_ns()), msg))
+        except Exception:
+            pass
+        self.log(msg)
+
+    # ---------------- setup ----------------
+
+    def setup(self):
+        os.makedirs(self.dir, exist_ok=True)
+        self.lock_fd = os.open(os.path.join(self.dir, "lock"),
+                               os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.log("another wb-pc-consoled already keeps %s (lock busy), exiting" % self.dir)
+            sys.exit(1)
+        for p in (self.in_path, self.ctl_path):
+            try:
+                if not stat.S_ISFIFO(os.stat(p).st_mode):
+                    os.remove(p)
+                    os.mkfifo(p, 0o666)
+            except FileNotFoundError:
+                os.mkfifo(p, 0o666)
+        self.raw_fd = os.open(self.raw_path,
+                              os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        self.ts_f = open(self.ts_path, "a", buffering=1, errors="replace")
+        # O_RDWR on the FIFOs: never blocks, never sees EOF when writers leave
+        self.in_fd = os.open(self.in_path, os.O_RDWR | os.O_NONBLOCK)
+        self.ctl_fd = os.open(self.ctl_path, os.O_RDWR | os.O_NONBLOCK)
+        signal.signal(signal.SIGTERM, self._sig)
+        signal.signal(signal.SIGINT, self._sig)
+        self.event("daemon started: pid=%d pattern=%s baud=%d dir=%s"
+                   % (os.getpid(), self.pattern, self.baud, self.dir))
+
+    def _sig(self, signum, frame):
+        self.running = False
+
+    # ---------------- intruder control ----------------
+
+    def port_users(self, real):
+        """PIDs (excluding self) holding the tty, via fuser; /proc scan fallback."""
+        me = os.getpid()
+        pids = set()
+        try:
+            p = subprocess.run(["fuser", real], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=5)
+            pids = {int(x) for x in re.findall(rb"\d+", p.stdout)}
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                want = os.stat(real).st_rdev
+            except OSError:
+                return []
+            for d in os.listdir("/proc"):
+                if not d.isdigit():
+                    continue
+                fddir = "/proc/%s/fd" % d
+                try:
+                    for fd in os.listdir(fddir):
+                        try:
+                            if os.stat(os.path.join(fddir, fd)).st_rdev == want:
+                                pids.add(int(d))
+                                break
+                        except OSError:
+                            continue
+                except OSError:
+                    continue
+        return sorted(p for p in pids if p != me)
+
+    def sweep(self, real=None):
+        real = real or self.real
+        if not real or not os.path.exists(real):
+            return
+        for pid in self.port_users(real):
+            name = "?"
+            try:
+                with open("/proc/%d/cmdline" % pid, "rb") as f:
+                    name = (f.read().replace(b"\0", b" ")
+                            .decode("utf-8", "replace").strip()[:120]) or "?"
+            except OSError:
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                self.event("intruder pid %d (%s) on %s: cannot kill (other uid)"
+                           % (pid, name, real))
+                continue
+            self.kills += 1
+            self.last_kill = "pid %d (%s)" % (pid, name)
+            self.event("SIGKILLed intruder pid %d (%s) on %s" % (pid, name, real))
+
+    # ---------------- port ----------------
+
+    def open_port(self):
+        matches = sorted(glob.glob(self.pattern))
+        if not matches:
+            if not self.waiting_logged:
+                self.event("waiting for device %s" % self.pattern)
+                self.waiting_logged = True
+            return
+        byid = matches[0]
+        if len(matches) > 1 and not self.multi_warned:
+            self.event("warning: %d matches for %s, using %s"
+                       % (len(matches), self.pattern, byid))
+            self.multi_warned = True
+        real = os.path.realpath(byid)
+        self.sweep(real)
+        try:
+            fd = os.open(real, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        except OSError as e:
+            self.open_failed(real, e)
+            return
+        try:
+            fcntl.ioctl(fd, TIOCEXCL)
+            spd = getattr(termios, "B%d" % self.baud, None)
+            if spd is None:
+                raise ValueError("unsupported baud %d" % self.baud)
+            attrs = termios.tcgetattr(fd)
+            attrs[0] = 0                                             # iflag: fully raw
+            attrs[1] = 0                                             # oflag
+            attrs[2] = termios.CREAD | termios.CLOCAL | termios.CS8  # no HUPCL: reopen w/o DTR glitch
+            attrs[3] = 0                                             # lflag
+            attrs[4] = spd
+            attrs[5] = spd
+            attrs[6][termios.VMIN] = 0
+            attrs[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        except (OSError, termios.error, ValueError) as e:
+            os.close(fd)
+            self.open_failed(real, e)
+            return
+        self.ser_fd = fd
+        self.byid = byid
+        self.real = real
+        self.waiting_logged = False
+        self.last_open_err = ""
+        self.last_rx_mono = time.monotonic()
+        self.event("port opened: %s -> %s @ %d 8N1 (exclusive)"
+                   % (byid, real, self.baud))
+        self.write_status(force=True)
+
+    def open_failed(self, real, e):
+        msg = "open %s failed: %s" % (real, e)
+        if msg != self.last_open_err:
+            self.event(msg)
+            self.last_open_err = msg
+        if isinstance(e, OSError) and e.errno in (errno.EIO, errno.EPROTO,
+                                                  errno.ENODEV, errno.ENXIO):
+            self.note_io_error()
+
+    def close_port(self, reason):
+        if self.ser_fd is None:
+            return
+        try:
+            os.close(self.ser_fd)
+        except OSError:
+            pass
+        self.ser_fd = None
+        self.event("port closed: %s" % reason)
+        self.write_status(force=True)
+
+    def reset_allowed(self, now):
+        return (self.last_reset_mono is None
+                or now - self.last_reset_mono >= self.reset_cooldown)
+
+    def note_io_error(self):
+        """Auto-USB-reset when I/O errors repeat while the device is still
+        enumerated -- that is the detectable 'wedged CDC-ACM' signature."""
+        now = time.monotonic()
+        self.io_errors = [t for t in self.io_errors if now - t < 10.0] + [now]
+        if len(self.io_errors) >= 3 and glob.glob(self.pattern):
+            if self.reset_allowed(now):
+                self.io_errors = []
+                self.usb_reset("auto: repeated I/O errors while device present")
+
+    # ---------------- USB reset ----------------
+
+    def usb_reset(self, reason):
+        real = self.real
+        if not real or not os.path.exists(real):
+            m = sorted(glob.glob(self.pattern))
+            real = os.path.realpath(m[0]) if m else None
+        if not real:
+            self.event("usb reset (%s): impossible, no device node for %s"
+                       % (reason, self.pattern))
+            return False
+        tty_name = os.path.basename(real)
+        try:
+            ifdir = os.path.realpath("/sys/class/tty/%s/device" % tty_name)
+            usbdir = os.path.dirname(ifdir)
+            with open(os.path.join(usbdir, "busnum")) as f:
+                bus = int(f.read())
+            with open(os.path.join(usbdir, "devnum")) as f:
+                dev = int(f.read())
+        except (OSError, ValueError) as e:
+            self.event("usb reset (%s): cannot resolve usb device of %s: %s"
+                       % (reason, tty_name, e))
+            return False
+        node = "/dev/bus/usb/%03d/%03d" % (bus, dev)
+        self.close_port("usb reset (%s)" % reason)
+        self.last_reset_mono = time.monotonic()
+        self.last_reset_ns = time.time_ns()
+        try:
+            fd = os.open(node, os.O_WRONLY)
+            try:
+                fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+            finally:
+                os.close(fd)
+            self.event("usb reset done: %s (%s)" % (node, reason))
+            self.write_status(force=True)
+            return True
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EPERM):
+                try:
+                    r = subprocess.run(
+                        ["sudo", "-n", sys.executable,
+                         os.path.realpath(__file__), "--usb-reset", node],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10)
+                    if r.returncode == 0:
+                        self.event("usb reset done via sudo: %s (%s)" % (node, reason))
+                        return True
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                self.event("usb reset FAILED: no write access to %s and no "
+                           "passwordless sudo (see README)" % node)
+            else:
+                self.event("usb reset FAILED on %s: %s" % (node, e))
+            return False
+
+    # ---------------- RX path ----------------
+
+    def feed(self, data, ns, mono):
+        os.write(self.raw_fd, data)
+        self.rx_total += len(data)
+        self.last_rx_mono = mono
+        start = 0
+        while True:
+            idx = data.find(b"\n", start)
+            if idx == -1:
+                rest = data[start:]
+                if rest:
+                    if not self.partial:
+                        self.partial_ns = ns
+                        self.partial_mono = mono
+                    self.partial += rest
+                break
+            line_ns = self.partial_ns if self.partial else ns
+            line = bytes(self.partial) + data[start:idx]
+            self.partial.clear()
+            self.emit(line_ns, line)
+            start = idx + 1
+
+    def emit(self, ns, bline):
+        text = bline.decode("utf-8", "replace").rstrip("\r")
+        self.ts_f.write("[%s] %s\n" % (fmt_ns(ns), text))
+
+    def flush_partial(self):
+        if self.partial:
+            self.emit(self.partial_ns, bytes(self.partial))
+            self.partial.clear()
+
+    # ---------------- TX path ----------------
+
+    def pump_tx(self, now):
+        if not self.tx or self.ser_fd is None:
+            return
+        if self.write_delay > 0:
+            if now - self.last_tx < self.write_delay:
+                return
+            chunk = bytes(self.tx[:1])
+        else:
+            chunk = bytes(self.tx)
+        try:
+            n = os.write(self.ser_fd, chunk)
+        except BlockingIOError:
+            return
+        except OSError as e:
+            self.event("write error: %s" % e)
+            self.close_port("write error")
+            self.note_io_error()
+            return
+        del self.tx[:n]
+        self.tx_total += n
+        self.last_tx = now
+
+    # ---------------- ctl commands ----------------
+
+    def handle_ctl(self, data):
+        self.ctl_buf += data
+        while b"\n" in self.ctl_buf:
+            line, self.ctl_buf = self.ctl_buf.split(b"\n", 1)
+            cmd = line.decode("utf-8", "replace").strip()
+            if not cmd:
+                continue
+            word, _, rest = cmd.partition(" ")
+            word = word.lower()
+            if word == "reset":
+                self.usb_reset(rest.strip() or "requested via ctl")
+            elif word == "break":
+                if self.ser_fd is not None:
+                    try:
+                        termios.tcsendbreak(self.ser_fd, 0)
+                        self.event("serial break sent")
+                    except (OSError, termios.error) as e:
+                        self.event("break failed: %s" % e)
+                else:
+                    self.event("break: port not open")
+            elif word == "reopen":
+                self.close_port("reopen requested")
+            elif word == "mark":
+                self.ts_f.write("[%s] ==== MARK: %s\n"
+                                % (fmt_ns(time.time_ns()), rest))
+            elif word == "flush":
+                self.flush_partial()
+            else:
+                self.event("unknown ctl command: %r" % cmd)
+
+    # ---------------- housekeeping ----------------
+
+    def write_status(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_status < 2.0:
+            return
+        self.last_status = now
+        st = {
+            "instance": self.inst,
+            "pid": os.getpid(),
+            "pattern": self.pattern,
+            "device": self.byid,
+            "tty": self.real,
+            "connected": self.ser_fd is not None,
+            "baud": self.baud,
+            "started_at": fmt_ns(self.started_ns),
+            "rx_bytes": self.rx_total,
+            "tx_bytes": self.tx_total,
+            "last_rx_age_s": (round(now - self.last_rx_mono, 3)
+                              if self.last_rx_mono is not None else None),
+            "pending_tx_bytes": len(self.tx),
+            "intruders_killed": self.kills,
+            "last_kill": self.last_kill,
+            "last_usb_reset_at": (fmt_ns(self.last_reset_ns)
+                                  if self.last_reset_ns else None),
+            "files": {"raw": self.raw_path, "ts": self.ts_path,
+                      "in": self.in_path, "ctl": self.ctl_path},
+        }
+        tmp = self.status_path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(st, f, indent=1)
+            os.replace(tmp, self.status_path)
+        except OSError:
+            pass
+
+    def _shift(self, path):
+        for i in range(self.keep - 1, 0, -1):
+            src = "%s.%d" % (path, i)
+            if os.path.exists(src):
+                os.replace(src, "%s.%d" % (path, i + 1))
+        os.replace(path, path + ".1")
+
+    def maybe_rotate(self):
+        if self.max_bytes <= 0:
+            return
+        try:
+            if os.fstat(self.raw_fd).st_size > self.max_bytes:
+                os.close(self.raw_fd)
+                self._shift(self.raw_path)
+                self.raw_fd = os.open(self.raw_path,
+                                      os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+                self.event("rotated raw.log")
+            if self.ts_f.tell() > self.max_bytes:
+                self.ts_f.close()
+                self._shift(self.ts_path)
+                self.ts_f = open(self.ts_path, "a", buffering=1, errors="replace")
+                self.event("rotated ts.log")
+        except OSError as e:
+            self.log("rotation failed: %s" % e)
+
+    # ---------------- main loop ----------------
+
+    def run(self):
+        self.setup()
+        while self.running:
+            if self.ser_fd is None:
+                self.open_port()
+            rlist = [self.in_fd, self.ctl_fd]
+            if self.ser_fd is not None:
+                rlist.append(self.ser_fd)
+            timeout = 0.05 if self.tx else 0.2
+            try:
+                r, _, _ = select.select(rlist, [], [], timeout)
+            except InterruptedError:
+                r = []
+            now = time.monotonic()
+
+            if self.ser_fd is not None and self.ser_fd in r:
+                try:
+                    data = os.read(self.ser_fd, 65536)
+                except BlockingIOError:
+                    data = None
+                except OSError as e:
+                    self.event("read error: %s" % e)
+                    self.close_port("read error")
+                    self.note_io_error()
+                    data = None
+                if data:
+                    self.feed(data, time.time_ns(), now)
+                elif data == b"":
+                    self.event("hangup (EOF) on %s" % self.real)
+                    self.close_port("hangup")
+                    self.note_io_error()
+
+            if self.in_fd in r:
+                try:
+                    data = os.read(self.in_fd, 65536)
+                except (BlockingIOError, OSError):
+                    data = b""
+                if data:
+                    if self.ser_fd is None and not self.tx:
+                        self.event("input while port closed, queueing %d bytes"
+                                   % len(data))
+                    self.tx += data
+                    if self.log_tx:
+                        self.event("TX %dB: %s" % (len(data), repr(data)[:160]))
+
+            if self.ctl_fd in r:
+                try:
+                    data = os.read(self.ctl_fd, 65536)
+                except (BlockingIOError, OSError):
+                    data = b""
+                if data:
+                    self.handle_ctl(data)
+
+            self.pump_tx(now)
+
+            if self.partial and now - self.partial_mono > self.flush_timeout:
+                self.flush_partial()
+
+            if self.ser_fd is not None and now - self.last_sweep >= self.kill_interval:
+                self.last_sweep = now
+                self.sweep()
+
+            if (self.auto_reset_idle > 0 and self.ser_fd is not None
+                    and self.last_rx_mono is not None
+                    and now - self.last_rx_mono > self.auto_reset_idle
+                    and self.reset_allowed(now)):
+                self.usb_reset("auto: no RX for %.0fs" % self.auto_reset_idle)
+
+            self.maybe_rotate()
+            self.write_status()
+
+            if self.ser_fd is None:
+                time.sleep(0.3)  # device absent or unopenable -- poll slowly
+
+        self.flush_partial()
+        self.event("daemon stopping (signal)")
+        self.write_status(force=True)
+
+
+def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--usb-reset":
+        fd = os.open(sys.argv[2], os.O_WRONLY)
+        try:
+            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+        finally:
+            os.close(fd)
+        return 0
+    if len(sys.argv) != 2 or sys.argv[1].startswith("-"):
+        sys.stderr.write(__doc__)
+        return 2
+    Keeper(sys.argv[1]).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

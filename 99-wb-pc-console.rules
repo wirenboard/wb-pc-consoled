@@ -1,0 +1,5 @@
+# Wiren Board debug console (Holtek 04d9:b534, WB7/WB8):
+# keep ModemManager away from it -- MM runs as root, so neither TIOCEXCL
+# nor the user-level kill sweep of wb-pc-consoled can stop its probing.
+# Install: sudo cp 99-wb-pc-console.rules /etc/udev/rules.d/ && sudo udevadm control --reload
+SUBSYSTEM=="tty", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="b534", ENV{ID_MM_DEVICE_IGNORE}="1"
