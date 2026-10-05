@@ -23,6 +23,8 @@ What it does:
         reset [why]   -- USB reset of the underlying USB device
         break         -- send serial break
         reopen        -- close and reopen the tty
+        kick          -- re-send the line coding (revives a Holtek bridge
+                         whose UART->USB direction latched up)
         mark <text>   -- write a marker line into ts.log
         flush         -- flush a pending partial line to ts.log
   * maintains <dir>/status.json (atomically replaced).
@@ -43,10 +45,21 @@ Environment knobs (all optional):
   WB_PC_CONSOLE_ROTATE_KEEP     rotated generations kept  (3)
   WB_PC_CONSOLE_RESET_COOLDOWN  min seconds between AUTOMATIC USB resets
                                 (30); manual ctl resets are never throttled
+  WB_PC_CONSOLE_LINE_KICK       automatic line-coding kicks: auto = only on
+                                the Holtek bridge 04d9:b534 (default),
+                                1 = on any adapter, 0 = never
+  WB_PC_CONSOLE_IDLE_KICK       kick after this many seconds without RX,
+                                then once per such period (10; 0 = kick
+                                only on open and after a stall)
   WB_PC_CONSOLE_LOG_TX          log TX chunks as ts.log events (1)
                                 NOTE: this records input the console does
                                 not echo back -- including passwords typed
                                 at login:/sudo prompts
+
+Line-coding kick: the Holtek bridge (04d9:b534) latches up, mute but
+error-free, once 130 unfetched bytes arrive; only a SET_LINE_CODING
+revives it. The daemon forces one (CSTOPB on and off) after every open,
+after its own loop stalled, on silence and on "kick" -- see README.
 
 There is deliberately no idle-based auto reset: a silent console is
 normal. Automatic USB reset fires only on bursts of I/O errors while the
@@ -64,6 +77,7 @@ import re
 import select
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import termios
@@ -72,6 +86,7 @@ import traceback
 
 USBDEVFS_RESET = 0x5514  # _IO('U', 20); stdlib has no constant for it
 USBFS_NODE_RE = re.compile(r"/dev/bus/usb/\d{3}/\d{3}")
+HOLTEK_ID = "04d9:b534"  # HT42B534, the WB7/WB8 debug console bridge
 
 TX_CAP = 256 * 1024   # max bytes queued for the port
 CTL_CAP = 4096        # max ctl bytes buffered without a newline
@@ -94,6 +109,22 @@ def fmt_ns(ns):
     lt = time.localtime(sec)
     return "%s.%09d%s" % (time.strftime("%Y-%m-%dT%H:%M:%S", lt), frac,
                           time.strftime("%z", lt))
+
+
+def boottime():
+    """Like time.monotonic(), but keeps counting while the host is suspended."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def usb_id(tty):
+    """'vid:pid' of the USB device behind a tty, '' if there is none."""
+    try:
+        ifdir = os.path.realpath("/sys/class/tty/%s/device" % os.path.basename(tty))
+        with open(os.path.join(os.path.dirname(ifdir), "idVendor")) as v, \
+                open(os.path.join(os.path.dirname(ifdir), "idProduct")) as p:
+            return "%s:%s" % (v.read().strip(), p.read().strip())
+    except OSError:
+        return ""
 
 
 def drain(fd):
@@ -119,6 +150,18 @@ class Keeper:
         self.keep = max(1, int(envf("WB_PC_CONSOLE_ROTATE_KEEP", 3)))
         self.reset_cooldown = envf("WB_PC_CONSOLE_RESET_COOLDOWN", 30.0)
         self.log_tx = envf("WB_PC_CONSOLE_LOG_TX", 1.0) != 0
+        self.kick_mode = envs("WB_PC_CONSOLE_LINE_KICK", "auto").lower()
+        self.idle_kick = envf("WB_PC_CONSOLE_IDLE_KICK", 10.0)
+        # the bridge latches up once ~4.1 KiB are unread (host buffers +
+        # its 128-byte FIFO): a reader late by 3500 characters (0.3 s at
+        # 115200) is taken as a possible latch-up
+        self.stall_kick = 3500 * 10.0 / self.baud
+        # time the bridge needs to shift out what it buffered of our TX
+        # (~300 bytes), with margin
+        self.tx_settle = max(0.1, 600 * 10.0 / self.baud)
+        # idle kicks also wait this long after our TX: the echo of what we
+        # just typed must not run into a kick
+        self.idle_tx_quiet = 1.0
 
         self.raw_path = os.path.join(self.dir, "raw.log")
         self.ts_path = os.path.join(self.dir, "ts.log")
@@ -147,6 +190,13 @@ class Keeper:
         self.last_rx_mono = None
         self.last_reset_mono = None
         self.last_reset_ns = None
+        self.auto_kick = False     # automatic kicks apply to the open port
+        self.kick_why = None       # reason of a kick waiting for TX to drain
+        self.kicks = 0             # line-coding kicks sent
+        self.stall_kicks = 0       # ... of them after a main-loop stall
+        self.last_kick_mono = 0.0
+        self.tx_busy_mono = 0.0    # last time our TX was seen in flight
+        self.prev_tick = None      # boottime at the end of the last select()
         self.started_ns = time.time_ns()
         self.io_errors = []        # monotonic times of recent read/open I/O errors
         self.fuser_ok = True       # flips off permanently if fuser is missing
@@ -413,6 +463,16 @@ class Keeper:
         self.last_rx_mono = time.monotonic()
         self.event("port opened: %s -> %s @ %d 8N1 (exclusive)"
                    % (byid, real, self.baud))
+        self.auto_kick = self.kick_mode == "1" or (
+            self.kick_mode == "auto" and usb_id(real) == HOLTEK_ID)
+        self.kick_why = None
+        self.prev_tick = None  # the slow no-device polling is not a stall
+        if self.auto_kick:
+            # the tty keeps its termios across close/open, so the tcsetattr
+            # above changed nothing and sent nothing if the previous user
+            # left 115200 8N1: a bridge that latched up while the port was
+            # closed would stay mute
+            self.kick_line_coding()
         self.write_status(force=True)
 
     def open_failed(self, real, e):
@@ -439,6 +499,63 @@ class Keeper:
         self.byid = None
         self.event("port closed: %s" % reason)
         self.write_status(force=True)
+
+    # ---------------- line-coding kick ----------------
+
+    def kick_line_coding(self):
+        """Make the driver emit SET_LINE_CODING without changing the baud:
+        set CSTOPB and clear it again (cdc-acm sends the request only for
+        changed settings; each of the two revives a latched-up HT42B534)."""
+        if self.ser_fd is None:
+            return False
+        self.last_kick_mono = time.monotonic()  # also paces retries
+        try:
+            attrs = termios.tcgetattr(self.ser_fd)
+            attrs[2] |= termios.CSTOPB
+            termios.tcsetattr(self.ser_fd, termios.TCSANOW, attrs)
+            attrs[2] &= ~termios.CSTOPB
+            termios.tcsetattr(self.ser_fd, termios.TCSANOW, attrs)
+        except (OSError, termios.error) as e:
+            self.log_rate("kick", "line-coding kick failed: %s" % e, 60.0)
+            return False
+        self.kicks += 1
+        self.prev_tick = None  # a slow control request is not a stall
+        return True
+
+    def tx_settled(self, now):
+        """True when nothing we sent is still on its way to the board: a
+        kick makes the bridge drop its host->UART buffer."""
+        try:
+            outq = struct.unpack("i", fcntl.ioctl(self.ser_fd, termios.TIOCOUTQ,
+                                                  b"\0\0\0\0"))[0]
+        except OSError:
+            outq = 0
+        if self.tx or outq:
+            self.tx_busy_mono = now
+        return now - self.tx_busy_mono >= self.tx_settle
+
+    def maybe_kick(self, now, stalled):
+        """Kick when asked to (ctl), after we were late reading (the bridge
+        may have latched up; what the board printed meanwhile is gone, but
+        the dead time ends here) and on a line that has been silent for
+        idle_kick seconds (a latched-up bridge and a quiet board look the
+        same, so that one is not logged, only counted)."""
+        if self.ser_fd is None:
+            return
+        if self.auto_kick and stalled > self.stall_kick and self.kick_why is None:
+            self.kick_why = ("main loop stalled for %.2f s, console output "
+                             "of that time may be lost" % stalled)
+            self.stall_kicks += 1
+        if self.kick_why is None and not (
+                self.auto_kick and self.idle_kick > 0
+                and now - max(self.last_rx_mono, self.last_kick_mono) >= self.idle_kick
+                and now - self.tx_busy_mono >= self.idle_tx_quiet):
+            return
+        if not self.tx_settled(now):
+            return
+        why, self.kick_why = self.kick_why, None
+        if self.kick_line_coding() and why:
+            self.event("line coding re-sent: %s" % why)
 
     def reset_allowed(self, now):
         return (self.last_reset_mono is None
@@ -581,7 +698,7 @@ class Keeper:
             return
         del self.tx[:n]
         self.tx_total += n
-        self.last_tx = now
+        self.last_tx = self.tx_busy_mono = now
 
     # ---------------- ctl commands ----------------
 
@@ -612,6 +729,11 @@ class Keeper:
                     self.event("break: port not open")
             elif word == "reopen":
                 self.close_port("reopen requested")
+            elif word == "kick":
+                if self.ser_fd is not None:
+                    self.kick_why = "requested via ctl"
+                else:
+                    self.event("kick: port not open")
             elif word == "mark":
                 self._ts_write("[%s] ==== MARK: %s\n"
                                % (fmt_ns(time.time_ns()), rest))
@@ -648,6 +770,9 @@ class Keeper:
             "last_kill": self.last_kill,
             "last_usb_reset_at": (fmt_ns(self.last_reset_ns)
                                   if self.last_reset_ns else None),
+            "line_kick_active": self.auto_kick,
+            "line_kicks": self.kicks,
+            "stall_kicks": self.stall_kicks,
             "files": {"raw": self.raw_path, "ts": self.ts_path,
                       "in": self.in_path, "ctl": self.ctl_path},
         }
@@ -720,12 +845,19 @@ class Keeper:
         rlist = [self.in_fd, self.ctl_fd]
         if self.ser_fd is not None:
             rlist.append(self.ser_fd)
-        timeout = 0.05 if self.tx else 0.2
+        timeout = 0.05 if self.tx or self.kick_why else 0.2
+        t_sel = boottime()
         try:
             r, _, _ = select.select(rlist, [], [], timeout)
         except InterruptedError:
             r = []
         now = time.monotonic()
+        # time the port was not serviced: work since the previous select()
+        # or a select() that returned late (SIGSTOP, suspend, overload)
+        t_end = boottime()
+        stalled = max(t_end - t_sel - timeout,
+                      t_sel - self.prev_tick if self.prev_tick else 0.0)
+        self.prev_tick = t_end
 
         if self.ser_fd is not None and self.ser_fd in r:
             try:
@@ -755,6 +887,7 @@ class Keeper:
                 self.handle_ctl(data)
 
         self.pump_tx(now)
+        self.maybe_kick(now, stalled)
 
         if self.partial and now - self.partial_mono > self.flush_timeout:
             self.flush_partial()

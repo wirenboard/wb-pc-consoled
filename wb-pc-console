@@ -21,6 +21,8 @@ Commands:
                                       for the outcome event; exit 0 = reset done
   break INST                          send serial break
   reopen INST                         make daemon close+reopen the tty
+  kick INST                           re-send the line coding (revives a mute
+                                      Holtek console without a USB reset)
   mark INST TEXT...                   write a marker line into ts.log
   tail INST [--ts] [-n N]             tail -F the raw (or timestamped) log
   attach INST                         interactive session, exit with Ctrl-]
@@ -425,6 +427,7 @@ def main():
 
     with_inst("break").set_defaults(fn=cmd_ctl_factory("break"))
     with_inst("reopen").set_defaults(fn=cmd_ctl_factory("reopen"))
+    with_inst("kick").set_defaults(fn=cmd_ctl_factory("kick"))
 
     sp = with_inst("mark")
     sp.add_argument("text", nargs="+")
