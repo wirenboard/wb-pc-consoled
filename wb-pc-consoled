@@ -196,6 +196,7 @@ class Keeper:
         self.stall_kicks = 0       # ... of them after a main-loop stall
         self.last_kick_mono = 0.0
         self.tx_busy_mono = 0.0    # last time our TX was seen in flight
+        self.tx_empty_since = 0.0  # first observation of empty TX after a write
         self.prev_tick = None      # boottime at the end of the last select()
         self.started_ns = time.time_ns()
         self.io_errors = []        # monotonic times of recent read/open I/O errors
@@ -522,7 +523,7 @@ class Keeper:
         self.prev_tick = None  # a slow control request is not a stall
         return True
 
-    def tx_settled(self, now):
+    def tx_settled(self):
         """True when nothing we sent is still on its way to the board: a
         kick makes the bridge drop its host->UART buffer."""
         try:
@@ -530,9 +531,16 @@ class Keeper:
                                                   b"\0\0\0\0"))[0]
         except OSError:
             outq = 0
+        # Reading/logging input or handling ctl may have blocked since the
+        # tick's timestamp. Date this observation after the ioctl itself.
+        now = time.monotonic()
         if self.tx or outq:
             self.tx_busy_mono = now
-        return now - self.tx_busy_mono >= self.tx_settle
+            self.tx_empty_since = None
+            return False
+        if self.tx_empty_since is None:
+            self.tx_empty_since = now
+        return now - self.tx_empty_since >= self.tx_settle
 
     def maybe_kick(self, now, stalled):
         """Kick when asked to (ctl), after we were late reading (the bridge
@@ -551,7 +559,7 @@ class Keeper:
                 and now - max(self.last_rx_mono, self.last_kick_mono) >= self.idle_kick
                 and now - self.tx_busy_mono >= self.idle_tx_quiet):
             return
-        if not self.tx_settled(now):
+        if not self.tx_settled():
             return
         why, self.kick_why = self.kick_why, None
         if self.kick_line_coding() and why:
@@ -699,6 +707,7 @@ class Keeper:
         del self.tx[:n]
         self.tx_total += n
         self.last_tx = self.tx_busy_mono = now
+        self.tx_empty_since = None
 
     # ---------------- ctl commands ----------------
 
@@ -846,6 +855,9 @@ class Keeper:
         if self.ser_fd is not None:
             rlist.append(self.ser_fd)
         timeout = 0.05 if self.tx or self.kick_why else 0.2
+        if self.auto_kick:
+            # Normal polling must stay below the stall budget at every baud.
+            timeout = min(timeout, self.stall_kick / 2)
         t_sel = boottime()
         try:
             r, _, _ = select.select(rlist, [], [], timeout)
@@ -855,8 +867,7 @@ class Keeper:
         # time the port was not serviced: work since the previous select()
         # or a select() that returned late (SIGSTOP, suspend, overload)
         t_end = boottime()
-        stalled = max(t_end - t_sel - timeout,
-                      t_sel - self.prev_tick if self.prev_tick else 0.0)
+        stalled = t_end - (self.prev_tick if self.prev_tick is not None else t_sel)
         self.prev_tick = t_end
 
         if self.ser_fd is not None and self.ser_fd in r:

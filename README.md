@@ -167,8 +167,12 @@ Cost of a kick: the bridge drops what it holds at that instant. On a
 silent line that is nothing, and the board sees no glitch. If the board
 is printing right then, about 100 bytes of output are lost (measured at
 full rate, 115200), and so is host→board data still inside the bridge —
-which is why every kick, manual ones included, waits until the daemon's
-TX queue, the kernel's and the bridge's have drained (+0.1 s).
+which is why kicks while the port is open, manual ones included, wait
+until the daemon's and kernel's TX queues are empty, then allow the
+bridge to drain for at least 0.1 s (longer at low baud rates). This
+interval starts when the empty queue is observed, even after a delayed
+poll. The initial kick on opening the port clears stale bridge data
+before the daemon sends anything.
 
 Automatic kicks are sent only to `04d9:b534`
 (`WB_PC_CONSOLE_LINE_KICK=auto`); `1` enables them for any adapter, `0`

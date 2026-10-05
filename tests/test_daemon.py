@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from tests.common import ROOT, load
 
@@ -176,6 +177,10 @@ class TestLineKick(Base):
         self.calls.append(bool(attrs[2] & D.termios.CSTOPB))
         return self.real(fd, when, attrs)
 
+    def maybe_kick(self, now, stalled):
+        with patch.object(D.time, "monotonic", return_value=now):
+            self.k.maybe_kick(now, stalled)
+
     def test_kick_sets_cstopb_and_restores(self):
         before = D.termios.tcgetattr(self.slave)
         self.assertTrue(self.k.kick_line_coding())
@@ -187,43 +192,43 @@ class TestLineKick(Base):
         self.k.ser_fd = None
         self.assertFalse(self.k.kick_line_coding())
         self.k.handle_ctl(b"kick\n")
-        self.k.maybe_kick(self.now, 9.0)
+        self.maybe_kick(self.now, 9.0)
         self.assertEqual(self.calls, [])
         self.assertIn("kick: port not open", "\n".join(ts_lines(self.k)))
 
     def test_idle_kick_needs_rx_silence_and_quiet_tx(self):
         self.k.last_rx_mono = self.now - 5
-        self.k.maybe_kick(self.now, 0.0)
+        self.maybe_kick(self.now, 0.0)
         self.assertEqual(self.k.kicks, 0)          # RX too recent
         self.k.last_rx_mono = self.now - 11
         self.k.tx_busy_mono = self.now - 0.5
-        self.k.maybe_kick(self.now, 0.0)
+        self.maybe_kick(self.now, 0.0)
         self.assertEqual(self.k.kicks, 0)          # our TX too recent
         self.k.tx_busy_mono = self.now - 2         # typing does not postpone it
-        self.k.maybe_kick(self.now, 0.0)
+        self.maybe_kick(self.now, 0.0)
         self.assertEqual(self.k.kicks, 1)
-        self.k.maybe_kick(time.monotonic(), 0.0)
+        self.maybe_kick(time.monotonic(), 0.0)
         self.assertEqual(self.k.kicks, 1)          # next one a period later
         self.assertNotIn("line coding", "\n".join(ts_lines(self.k)))
 
     def test_idle_kick_disabled(self):
         self.k.idle_kick = 0
-        self.k.maybe_kick(self.now, 0.0)
+        self.maybe_kick(self.now, 0.0)
         self.k.idle_kick, self.k.auto_kick = 10.0, False
-        self.k.maybe_kick(self.now, 9.0)           # no stall kick either
+        self.maybe_kick(self.now, 9.0)           # no stall kick either
         self.assertEqual(self.calls, [])
 
     def test_stall_kick_waits_for_tx_to_drain(self):
         self.k.idle_kick = 0
-        self.k.maybe_kick(self.now, self.k.stall_kick * 0.9)
+        self.maybe_kick(self.now, self.k.stall_kick * 0.9)
         self.assertEqual(self.k.kicks, 0)          # normal cadence
         self.k.tx = bytearray(b"x")
-        self.k.maybe_kick(self.now, 2.0)
+        self.maybe_kick(self.now, 2.0)
         self.assertEqual(self.k.kicks, 0)          # our TX is queued
         self.k.tx = bytearray()
-        self.k.maybe_kick(self.now + self.k.tx_settle / 2, 0.0)
+        self.maybe_kick(self.now + self.k.tx_settle / 2, 0.0)
         self.assertEqual(self.k.kicks, 0)          # ... or still in the bridge
-        self.k.maybe_kick(self.now + self.k.tx_settle * 2, 0.0)
+        self.maybe_kick(self.now + self.k.tx_settle * 2, 0.0)
         self.assertEqual((self.k.kicks, self.k.stall_kicks), (1, 1))
         self.assertIn("main loop stalled for 2.00 s", "\n".join(ts_lines(self.k)))
 
@@ -233,15 +238,77 @@ class TestLineKick(Base):
         D.fcntl.ioctl = lambda fd, req, arg: D.struct.pack("i", outq[0])
         try:
             self.k.handle_ctl(b"kick\n")
-            self.k.maybe_kick(self.now, 0.0)
+            self.maybe_kick(self.now, 0.0)
             self.assertEqual(self.k.kicks, 0)
             outq[0] = 0
-            self.k.maybe_kick(self.now + 1, 0.0)
+            self.maybe_kick(self.now + 1, 0.0)
+            self.assertEqual(self.k.kicks, 0)  # bridge may just have received TX
+            self.maybe_kick(self.now + 1 + self.k.tx_settle * 2, 0.0)
         finally:
             D.fcntl.ioctl = real
         self.assertEqual(self.k.kicks, 1)
         self.assertIn("line coding re-sent: requested via ctl",
                       "\n".join(ts_lines(self.k)))
+
+    def test_kick_waits_after_first_empty_observation_following_write(self):
+        self.k.tx = bytearray(b"hello")
+        self.k.pump_tx(self.now)
+        self.k.handle_ctl(b"kick\n")
+        # A delayed poll says nothing about when the last USB packet left
+        # the kernel; allow the bridge a full settling interval from now.
+        self.maybe_kick(self.now + 2, 0.0)
+        self.assertEqual(self.k.kicks, 0)
+        self.maybe_kick(self.now + 2 + self.k.tx_settle * 2, 0.0)
+        self.assertEqual(self.k.kicks, 1)
+
+    def test_empty_tx_observation_uses_clock_after_ioctl(self):
+        self.k.tx_empty_since = None
+        self.k.handle_ctl(b"kick\n")
+        clock = [self.now]
+
+        def delayed_ioctl(fd, req, arg):
+            clock[0] = self.now + 2
+            return D.struct.pack("i", 0)
+
+        # The loop timestamp predates both processing and the queue query.
+        with patch.object(D.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(D.fcntl, "ioctl", side_effect=delayed_ioctl):
+            self.k.maybe_kick(self.now, 0.0)
+        self.assertEqual(self.k.tx_empty_since, self.now + 2)
+        self.assertEqual(self.k.kicks, 0)
+        self.maybe_kick(self.now + 2 + self.k.tx_settle / 2, 0.0)
+        self.assertEqual(self.k.kicks, 0)
+        self.maybe_kick(self.now + 2 + self.k.tx_settle * 2, 0.0)
+        self.assertEqual(self.k.kicks, 1)
+
+    def test_tick_counts_whole_interval_without_reading(self):
+        self.k.idle_kick = 0
+        self.k.in_fd, self.k.ctl_fd = -1, -2
+        self.k.last_sweep = self.now
+        for select_start in (100.0, 100.2):
+            with self.subTest(select_start=select_start):
+                self.k.prev_tick = 100.0
+                before = self.k.kicks
+                with patch.object(D, "boottime", side_effect=[select_start, 100.4]), \
+                        patch.object(D.select, "select", return_value=([], [], [])), \
+                        patch.object(self.k, "maybe_rotate"), \
+                        patch.object(self.k, "write_status"):
+                    self.k._tick()
+                self.assertEqual(self.k.kicks, before + 1)
+
+    def test_high_baud_polling_stays_within_stall_budget(self):
+        self.k.idle_kick = 0
+        self.k.in_fd, self.k.ctl_fd = -1, -2
+        self.k.last_sweep = self.now
+        self.k.stall_kick = 0.05
+        self.k.prev_tick = 100.0
+        with patch.object(D, "boottime", side_effect=[100.0, 100.025]), \
+                patch.object(D.select, "select", return_value=([], [], [])) as select_call, \
+                patch.object(self.k, "maybe_rotate"), \
+                patch.object(self.k, "write_status"):
+            self.k._tick()
+        self.assertEqual(select_call.call_args.args[3], 0.025)
+        self.assertEqual(self.k.kicks, 0)
 
     def test_auto_mode_only_for_the_holtek_bridge(self):
         self.assertEqual(self.k.kick_mode, "auto")
