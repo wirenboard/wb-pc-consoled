@@ -13,13 +13,18 @@ the same debug console. Solves three chronic problems:
    daemon finds the port by stable serial:
    `/dev/serial/by-id/*<SERIAL>*-if00`, and transparently reopens after
    re-enumeration. Log files and FIFOs never move.
-2. **CDC-ACM wedges until a USB reset** — `wb-pc-console reset <INST>`
-   does a `USBDEVFS_RESET` ioctl on the parent USB device and reports the
-   outcome in its exit code (0 = reset done). Bursts of I/O errors while
-   the device is still enumerated trigger an automatic reset; *silence*
-   does not (a quiet console is normal), so deciding on a reset for a
-   silent-but-suspicious console is left to the operator or agent — see
-   "Idle watchdog" below.
+2. **The console goes mute until a USB reset** — two different faults:
+   - The Holtek bridge of the WB7/WB8 debug console latches up when the
+     host does not fetch its data in time: output stops, input still
+     works, no error is reported. The daemon prevents the usual cause
+     (nobody reading) by always reading, and cures the rest without a
+     reset by re-sending the line coding — see "Holtek latch-up and the
+     line-coding kick" below.
+   - For anything else there is `wb-pc-console reset <INST>`: a
+     `USBDEVFS_RESET` ioctl on the parent USB device, outcome in the exit
+     code (0 = reset done). Bursts of I/O errors while the device is still
+     enumerated trigger that reset automatically; *silence* never does (a
+     quiet console is normal) — see "Idle watchdog" below.
 3. **Third parties grab the port** — the daemon holds it with `TIOCEXCL`
    (other non-root `open()`s fail with EBUSY) and additionally sweeps
    `fuser` every second, SIGKILLing any process that got hold of the tty.
@@ -62,8 +67,8 @@ Requirements: Linux, Python 3 (stdlib only), `fuser` (psmisc; a pure
 | `raw.log`     | every received byte, verbatim, no timestamps                   |
 | `ts.log`      | one line per console line: `[2026-07-06T17:31:02.123456789+0300] text` (ns precision, stamped at first byte of the line); daemon events as `=== wb-pc-console: …`, markers as `==== MARK: …` |
 | `in`          | FIFO → bytes written here go out the serial port (queued up to 256 KiB while the port is down) |
-| `ctl`         | FIFO → commands: `reset` `break` `reopen` `mark <text>` `flush`|
-| `status.json` | connected?, tty, rx/tx counters, drops, kills, last reset, pid |
+| `ctl`         | FIFO → commands: `reset` `break` `reopen` `kick` `mark <text>` `flush`|
+| `status.json` | connected?, tty, rx/tx counters, drops, kills, last reset, line kicks, pid |
 
 The instance directory is `0700` and every file in it `0600`: the FIFOs
 drive what is usually a **root shell** on the board, and with
@@ -84,6 +89,7 @@ wb-pc-console run  ABCD1234 "date" --expect '2026' --timeout 10   # send + wait,
 wb-pc-console expect ABCD1234 'login:' --timeout 120             # just wait for pattern
 wb-pc-console key  ABCD1234 ctrl-c enter            # named keys; also sysrq-<x> (break+key)
 wb-pc-console reset ABCD1234                        # USB reset; rc=0 only if it succeeded
+wb-pc-console kick ABCD1234                         # mute Holtek console: re-send line coding
 wb-pc-console mark ABCD1234 "suspend test #5"       # marker line into ts.log
 wb-pc-console tail ABCD1234 --ts                    # follow timestamped log
 wb-pc-console status ABCD1234 ; wb-pc-console files ABCD1234
@@ -118,10 +124,70 @@ Sending raw bytes without the helper also works — the FIFO is the API:
   `status.json` (`log_dropped`) instead of crashing, and the port stays
   open and drained throughout.
 
+## Holtek latch-up and the line-coding kick
+
+The WB7/WB8 debug console bridge (Holtek HT42B534, `04d9:b534`) has a
+128-byte UART→USB FIFO and no flow control. When the **130th** byte
+arrives that the host has not fetched, the UART→USB direction stops
+**for good**. That happens when
+
+- the board prints ≥ 130 bytes while no program has the port open (a
+  boot log, a getty banner), or
+- the reader falls behind by ~4.1 KiB (the host side buffers about 4 KiB
+  before the FIFO starts to fill) — 0.36 s of full-rate output at 115200.
+
+Nothing is reported: no I/O error, no hangup, no notification, and
+host→board keeps working, so the console looks alive but mute. Waiting,
+close/reopen, DTR/RTS, break and `tcsetattr` with unchanged settings do
+not help. What does: any `SET_LINE_CODING` request — and the Linux
+cdc-acm driver sends one only when the settings *change*. A terminal
+program that opens the port at the 115200 8N1 the previous one left
+behind therefore sees nothing; so did this daemon after a restart.
+
+The daemon forces the request out by setting `CSTOPB` and clearing it
+again (8N1 → 8N2 → 8N1, two control requests, ~15 ms, baud untouched, no
+USB reset, the tty stays open):
+
+- right after every open of the port;
+- when its own main loop was late by more than 3500 character times
+  (0.3 s at 115200: laptop suspend, SIGSTOP, a blocked log write, an
+  overloaded host) — logged in `ts.log` as `line coding re-sent: main
+  loop stalled for … s`. Output of that interval is lost either way (the
+  chip dropped it); the kick only ends the dead time;
+- after `WB_PC_CONSOLE_IDLE_KICK` seconds (default 10) without a
+  received byte (and 1 s after the last sent one), and again every such
+  period while the silence lasts — so a mute console comes back within
+  ~10 s even while someone keeps pressing Enter.
+  For this chip silence does not prove health — a latched-up bridge and
+  a quiet board look the same — so this one is not logged, only counted
+  (`line_kicks` in `status.json`);
+- on `wb-pc-console kick INST` (`kick` in the ctl FIFO).
+
+Cost of a kick: the bridge drops what it holds at that instant. On a
+silent line that is nothing, and the board sees no glitch. If the board
+is printing right then, about 100 bytes of output are lost (measured at
+full rate, 115200), and so is host→board data still inside the bridge —
+which is why kicks while the port is open, manual ones included, wait
+until the daemon's and kernel's TX queues are empty, then allow the
+bridge to drain for at least 0.1 s (longer at low baud rates). This
+interval starts when the empty queue is observed, even after a delayed
+poll. The initial kick on opening the port clears stale bridge data
+before the daemon sends anything.
+
+Automatic kicks are sent only to `04d9:b534`
+(`WB_PC_CONSOLE_LINE_KICK=auto`); `1` enables them for any adapter, `0`
+turns them off. `WB_PC_CONSOLE_IDLE_KICK=0` keeps the open and stall
+kicks but stops the periodic one. `status.json` shows
+`line_kick_active`, `line_kicks` and `stall_kicks`.
+
+`break` does nothing on this chip (it answers SEND_BREAK with a STALL),
+so it is no way out of a latch-up either.
+
 ## Idle watchdog (optional, external)
 
 The daemon deliberately has no "reset when silent" logic — silence is
-normal for an idle console. If you want one for a board that is supposed
+normal for an idle console, and the one known silent failure (the Holtek
+latch-up above) is handled without a reset. If you want one for a board that is supposed
 to be chatty, poll `status.json` from outside:
 
 ```sh
@@ -160,6 +226,9 @@ glob override), `WB_PC_CONSOLE_BAUD` (115200),
 (per-byte TX pacing for paste-sensitive bootloaders),
 `WB_PC_CONSOLE_FLUSH_TIMEOUT` (1 s partial-line flush),
 `WB_PC_CONSOLE_MAX_BYTES` / `WB_PC_CONSOLE_ROTATE_KEEP` (rotation),
+`WB_PC_CONSOLE_LINE_KICK` (`auto`: line-coding kicks on the Holtek
+bridge only; `1` any adapter; `0` off), `WB_PC_CONSOLE_IDLE_KICK` (10 s
+of silence before a periodic kick; 0 = none),
 `WB_PC_CONSOLE_RESET_COOLDOWN` (30 s — throttles **automatic** resets
 only; manual `ctl` resets always fire), `WB_PC_CONSOLE_LOG_TX` (log sent
 chunks into ts.log; **records non-echoed input, e.g. passwords**).
@@ -168,7 +237,7 @@ chunks into ts.log; **records non-echoed input, e.g. passwords**).
 
 `python3 -m unittest discover -s tests` — pure-logic units (line
 assembly and ns stamping, log follower rotation handling, escape/key
-tables, fuser output parsing, rotation, ctl parsing, status contract)
+tables, fuser output parsing, rotation, ctl parsing, status contract, line-coding kick conditions)
 run against temp files; no hardware needed. CI runs them on every push.
 
 ## Mechanism notes
